@@ -1,0 +1,10 @@
+torch>=2.1.0
+torchvision>=0.16.0
+# PyTorch3D - install separately, see README comments below
+# pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+# or: conda install pytorch3d -c pytorch3d
+numpy
+Pillow
+matplotlib
+scipy
+tqdm
