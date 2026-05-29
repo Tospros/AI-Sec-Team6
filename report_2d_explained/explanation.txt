@@ -1,0 +1,58 @@
+The delta.grad image:
+report_2d_explained/assets/delta_grad.png
+
+HOW THE TRANSFORMATIONS WORK IN THIS CASE (2D EOT attack)
+
+WHERE THIS IS IN THE CODE
+
+File pipeline_2d/attack.py, the attack loop:
+
+    L99:   x_adv = (x + delta).clamp(0, 1)          # image + perturbation, [0,1]
+    L102:  x_t, _ = apply_transforms_2d(x_adv, cfg) # ONE random transformation
+    L105:  logits = classifier(x_t.permute(...))    # this is what the classifier sees
+    ...
+    L118:  total_loss.backward()                    # gradient over all samples
+    L122:  grad_sign = delta.grad.sign()            # PGD step
+
+The transformation itself is defined in pipeline_2d/transforms.py in the
+function apply_transforms_2d, which composes three stages in a fixed order:
+
+spatial  ->  color  ->  noise
+
+
+THE THREE TRANSFORMATION STAGES (in order)
+---------------------------------------------
+
+STAGE 1 — SPATIAL TRANSFORM (affine, via grid_sample)
+  The function sample_affine_matrix samples a 2x3 matrix "theta":
+    - scale:        U(0.8, 1.2)      (zoom in / out)
+    - rotation:     U(-30, +30) degrees
+    - translation:  U(-0.1, +0.1) of the image size (vertical and horizontal)
+  The rotation entries are divided by the scale (cos/scale, sin/scale),
+  because affine_grid/grid_sample define the sampling grid INVERSELY
+  (output -> input), so dividing by the scale produces a real zoom.
+
+  apply_spatial_transform runs F.affine_grid + F.grid_sample with
+  padding_mode="border" — edge pixels are REPLICATED (hence the slightly
+  "stretched" borders on rotated views, instead of a black background).
+
+STAGE 2 — COLOR JITTER (apply_color_jitter)
+    - brightness: add a value U(-0.2, +0.2) (additive),
+    - contrast: deviation from the image mean multiplied by U(0.8, 1.2),
+    - finally clamp to [0,1].
+
+STAGE 3 — GAUSSIAN NOISE (apply_noise)
+    - add noise N(0, sigma^2), in the demo sigma = 0.02,
+    - clamp to [0,1].
+
+The result is x_t — and it is exactly this tensor (the turtle image + the
+invisible perturbation, after rotation/scale/color/noise) that is fed to the
+classifier at L105.
+
+ONE-SENTENCE SUMMARY
+-----------------------
+The transformations are random, differentiable operations (rotation/scale/
+translation + color + noise) applied to the image before classification; by
+averaging the gradient over many such random draws (EOT), the perturbation
+learns to work on the whole distribution of views, not just on one perfect
+image.

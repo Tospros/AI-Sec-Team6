@@ -1,0 +1,21 @@
+{
+  "grad_min": -0.2993702292442322,
+  "grad_max": 0.2949090898036957,
+  "grad_mean": -7.350821306317812e-06,
+  "grad_std": 0.017326408997178078,
+  "grad_abs_max": 0.2993702292442322,
+  "grad_frac_positive_sign": 0.5006692409515381,
+  "orig_pred": 33,
+  "orig_label": "loggerhead",
+  "adv_pred": 33,
+  "adv_label": "loggerhead",
+  "target": 764,
+  "target_label": "rifle",
+  "final_target_prob": 2.793984085704051e-14,
+  "epsilon": 0.05,
+  "step_size": 0.0025,
+  "num_steps": 25,
+  "eot_samples": 12,
+  "xt_min": 0.0,
+  "xt_max": 0.9928997755050659
+}
