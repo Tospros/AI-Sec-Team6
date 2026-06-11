@@ -24,10 +24,20 @@ class TransformConfig:
     # XY translation of object (in world units)
     translate_xy_range: float = 0.05
 
-    # Rotation: uniform over all SO(3) by default
-    # Set rotation_y_range_deg to restrict to yaw-only
+    # Rotation sampling mode:
+    #   "so3"        — uniform over all SO(3)  (default)
+    #   "yaw"        — yaw-only, within ±rotation_y_range_deg
+    #   "yaw_pitch"  — yaw within [yaw_min_deg, yaw_max_deg] and
+    #                  pitch within [pitch_min_deg, pitch_max_deg]
+    rotation_mode: str = "so3"
+    rotation_y_range_deg: float = 180.0       # used by "yaw"
+    yaw_min_deg: float = -180.0               # used by "yaw_pitch"
+    yaw_max_deg: float = 180.0
+    pitch_min_deg: float = 0.0
+    pitch_max_deg: float = 0.0
+
+    # Legacy flag: when False (and rotation_mode left at default) → yaw-only.
     full_rotation: bool = True
-    rotation_y_range_deg: float = 180.0  # used only when full_rotation=False
 
     # Background color (uniform random RGB per channel)
     bg_color_min: float = 0.1
@@ -81,6 +91,36 @@ def sample_yaw_rotation(batch_size: int, range_deg: float, device: torch.device)
     return R
 
 
+def sample_yaw_pitch_rotation(
+    batch_size: int,
+    yaw_min: float, yaw_max: float,
+    pitch_min: float, pitch_max: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Sample rotations as R = Rx(pitch) @ Ry(yaw), with yaw/pitch drawn uniformly
+    from the given (degree) ranges. Yaw spins the object; pitch tilts the camera
+    up/down. Returns (B, 3, 3).
+    """
+    yaw = torch.empty(batch_size, device=device).uniform_(yaw_min, yaw_max) * (torch.pi / 180.0)
+    pitch = torch.empty(batch_size, device=device).uniform_(pitch_min, pitch_max) * (torch.pi / 180.0)
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    z, o = torch.zeros_like(cy), torch.ones_like(cy)
+
+    Ry = torch.stack([
+        torch.stack([cy, z, sy], dim=1),
+        torch.stack([z, o, z], dim=1),
+        torch.stack([-sy, z, cy], dim=1),
+    ], dim=1)
+    Rx = torch.stack([
+        torch.stack([o, z, z], dim=1),
+        torch.stack([z, cp, -sp], dim=1),
+        torch.stack([z, sp, cp], dim=1),
+    ], dim=1)
+    return Rx @ Ry
+
+
 def sample_transforms(
     batch_size: int,
     cfg: TransformConfig,
@@ -94,11 +134,20 @@ def sample_transforms(
         T: (B, 3)     translation vectors (camera position in world)
         bg: (B, 3)    background RGB colors in [0, 1]
     """
-    # Rotation
-    if cfg.full_rotation:
-        R = sample_rotation_matrix(batch_size, device)
-    else:
+    # Resolve rotation mode (honour the legacy full_rotation flag)
+    mode = cfg.rotation_mode
+    if mode == "so3" and not cfg.full_rotation:
+        mode = "yaw"
+
+    if mode == "yaw_pitch":
+        R = sample_yaw_pitch_rotation(
+            batch_size, cfg.yaw_min_deg, cfg.yaw_max_deg,
+            cfg.pitch_min_deg, cfg.pitch_max_deg, device,
+        )
+    elif mode == "yaw":
         R = sample_yaw_rotation(batch_size, cfg.rotation_y_range_deg, device)
+    else:
+        R = sample_rotation_matrix(batch_size, device)
 
     # Camera distance (radial)
     dist = torch.empty(batch_size, device=device).uniform_(cfg.dist_min, cfg.dist_max)

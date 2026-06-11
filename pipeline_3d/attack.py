@@ -1,18 +1,24 @@
 """
-3D EOT (Expectation Over Transformation) adversarial attack.
+3D EOT (Expectation Over Transformation) adversarial-mask attack.
 
-Optimizes the texture map of a 3D mesh so that the object is misclassified
-from arbitrary viewpoints.
+Optimizes a single screen-space mask (delta) that, when overlaid on the 2D
+projection of a 3D mesh rendered from an arbitrary viewpoint, fools the
+classifier. The mask is "looked through": we render the mesh, add the mask to
+that projection, and classify the result.
+
+    delta = argmax  E_{view ~ V}[ loss(f(render(mesh, view) + delta), y) ]
+    s.t.   ||delta||_inf <= epsilon   and   render + delta in [0, 1]
 
 Reference: Athalye et al. 2017 - "Synthesizing Robust Adversarial Examples"
 
-Gradient flow:
-    loss  ←  classifier  ←  rendered_image  ←  F.grid_sample  ←  texture_map
+Note: delta is added *after* rendering, so the render is constant w.r.t. delta.
+We render under no_grad and only backprop into the mask — the attack therefore
+works even when the underlying rasterizer is non-differentiable.
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Optional, Callable, Tuple
+from typing import Optional, Callable, Tuple, List
 from dataclasses import dataclass
 
 from pipeline_3d.transforms import TransformConfig, sample_transforms
@@ -23,32 +29,32 @@ class Attack3DConfig:
     # Target class index (None = untargeted)
     target_class: Optional[int] = None
 
-    # Texture constraint
-    # None  → only clamp texture to [0, 1]
-    # float → additionally enforce L-inf ball of this radius around original texture
-    epsilon: Optional[float] = None
+    # Class indices to suppress (e.g. all turtle classes). When set and no
+    # target_class is given, the objective drives the total probability mass on
+    # these classes toward zero — i.e. "make the classifier stop saying turtle".
+    protected_classes: Optional[List[int]] = None
 
-    step_size: float = 0.01
+    # L-inf bound on the screen-space mask
+    epsilon: float = 0.05
+
+    step_size: float = 0.005
     num_steps: int = 200
 
-    # EOT: number of random viewpoints per gradient step
+    # EOT: number of random viewpoints rendered per gradient step
     eot_samples: int = 20
 
     log_every: int = 20
 
 
-class EOTAttack3D:
+class EOTMaskAttack3D:
     """
-    PGD-based adversarial texture optimization with EOT over 3D viewpoints.
-
-    Optimizes:
-        texture = argmax  E_{t ~ T}[ loss(f(render(mesh_t, texture)), y_target) ]
-        s.t.     texture in [0, 1]   (and optionally ||texture - texture_orig||_inf <= eps)
+    PGD optimization of a universal screen-space adversarial mask, robust over
+    random 3D viewpoints (EOT).
 
     Args:
-        classifier:     callable (B, H, W, 3) → (B, num_classes) logits.
-        renderer:       SoftwareTexturedMeshRenderer (or PyTorch3D variant).
-                        renderer.texture_map must be an nn.Parameter.
+        classifier:     callable (B, H, W, 3) -> (B, num_classes) logits.
+        renderer:       textured-mesh renderer exposing render_with_background
+                        and `image_size`.
         transform_cfg:  distribution of random 3D camera poses.
         attack_cfg:     attack hyperparameters.
         device:         torch device.
@@ -68,73 +74,119 @@ class EOTAttack3D:
         self.cfg = attack_cfg or Attack3DConfig()
         self.device = device or torch.device("cpu")
 
+    def _render_views(self, n: int) -> torch.Tensor:
+        """Render n random viewpoints. Constant w.r.t. the mask, so no grad."""
+        with torch.no_grad():
+            R, T, bg = sample_transforms(n, self.transform_cfg, self.device)
+            images, _ = self.renderer.render_with_background(R, T, bg)
+        return images.detach()  # (n, H, W, 3)
+
+    def _eval_fool(self, n: int, delta: torch.Tensor) -> Tuple[float, list, Optional[float]]:
+        """
+        Render fresh views, apply the mask, and report how well it works.
+
+        Returns (rate, adv_preds, protected_prob):
+            rate            success metric (see below)
+            adv_preds       per-view top-1 class after the mask
+            protected_prob  mean prob mass on protected_classes after the mask
+                            (None when protected_classes is not set)
+        """
+        cfg = self.cfg
+        with torch.no_grad():
+            imgs = self._render_views(n)
+            clean_pred = self.classifier(imgs).argmax(dim=1)
+            adv = (imgs + delta).clamp(0.0, 1.0)
+            adv_logits = self.classifier(adv)
+            adv_pred = adv_logits.argmax(dim=1)
+
+            prot_prob = None
+            if cfg.target_class is not None:
+                rate = (adv_pred == cfg.target_class).float().mean().item()
+            elif cfg.protected_classes is not None:
+                prot = torch.tensor(cfg.protected_classes, device=self.device)
+                prot_prob = torch.softmax(adv_logits, dim=1)[:, prot].sum(dim=1).mean().item()
+                # success = view no longer classified as any protected class
+                is_prot = (adv_pred.unsqueeze(1) == prot.unsqueeze(0)).any(dim=1)
+                rate = (~is_prot).float().mean().item()
+            else:
+                rate = (adv_pred != clean_pred).float().mean().item()
+        return rate, adv_pred.tolist(), prot_prob
+
     def attack(self) -> Tuple[torch.Tensor, dict]:
         """
-        Optimize renderer.texture_map in-place.
+        Optimize the screen-space mask.
 
         Returns:
-            best_texture:  (1, H, W, 3) optimized texture tensor
-            history:       dict with 'loss' and 'pred' lists
+            delta:    (1, H, W, 3) optimized mask (values in [-eps, eps])
+            history:  dict with 'loss' and 'fool_rate' lists
         """
-        renderer = self.renderer
         cfg = self.cfg
+        H = W = self.renderer.image_size
 
-        # Save original texture for L-inf constraint (if epsilon given)
-        tex_orig = renderer.texture_map.data.clone() if cfg.epsilon is not None else None
+        prot = (torch.tensor(cfg.protected_classes, device=self.device)
+                if cfg.protected_classes is not None else None)
 
-        renderer.texture_map.requires_grad_(True)
+        # Initialize the mask uniformly in [-eps, eps]
+        delta = torch.empty(1, H, W, 3, device=self.device).uniform_(-cfg.epsilon, cfg.epsilon)
+        delta.requires_grad_(True)
 
-        history = {"loss": [], "pred": []}
+        history = {"step": [], "loss": [], "fool_rate": [], "protected_prob": []}
 
         for step in range(cfg.num_steps):
-            if renderer.texture_map.grad is not None:
-                renderer.texture_map.grad.zero_()
+            if delta.grad is not None:
+                delta.grad.zero_()
 
-            step_loss_accum = 0.0
+            # Render a fresh batch of viewpoints (the EOT expectation samples).
+            # Fresh every step => the mask is optimized over the whole mesh's
+            # viewpoint distribution, not a fixed set of projections.
+            imgs = self._render_views(cfg.eot_samples)  # (B, H, W, 3), constant w.r.t. delta
 
-            # Accumulate gradients over EOT samples
-            for _ in range(cfg.eot_samples):
-                R, T, bg = sample_transforms(1, self.transform_cfg, self.device)
-                images, _ = renderer.render_with_background(R, T, bg)  # (1, H, W, 3)
+            adv = (imgs + delta).clamp(0.0, 1.0)        # "look through the mask"
+            logits = self.classifier(adv)               # (B, num_classes)
 
-                logits = self.classifier(images)  # (1, num_classes)
+            if cfg.target_class is not None:
+                target = torch.full(
+                    (imgs.shape[0],), cfg.target_class, device=self.device, dtype=torch.long
+                )
+                loss = F.cross_entropy(logits, target)   # minimize -> push toward target
+                sign = -1.0
+            elif prot is not None:
+                p = torch.softmax(logits, dim=1)[:, prot].sum(dim=1)
+                loss = -(1.0 - p + 1e-6).log().mean()    # minimize -> suppress protected mass
+                sign = -1.0
+            else:
+                with torch.no_grad():
+                    clean_pred = self.classifier(imgs).argmax(dim=1)
+                loss = F.cross_entropy(logits, clean_pred)  # maximize -> push away from clean
+                sign = +1.0
 
-                if cfg.target_class is not None:
-                    target = torch.tensor([cfg.target_class], device=self.device)
-                    loss = -F.cross_entropy(logits, target)   # maximize target class prob
-                else:
-                    pred = logits.argmax(dim=1).detach()
-                    loss = F.cross_entropy(logits, pred)       # maximize CE on current pred
+            loss.backward()
 
-                (loss / cfg.eot_samples).backward()
-                step_loss_accum += loss.item()
-
-            step_loss = step_loss_accum / cfg.eot_samples
-
-            # PGD step
+            # PGD step + projection onto the L-inf ball
             with torch.no_grad():
-                renderer.texture_map.data -= cfg.step_size * renderer.texture_map.grad.sign()
-
-                # L-inf projection around original texture (optional)
-                if cfg.epsilon is not None:
-                    renderer.texture_map.data.clamp_(
-                        tex_orig - cfg.epsilon,
-                        tex_orig + cfg.epsilon,
-                    )
-
-                # Always clamp to valid RGB range
-                renderer.texture_map.data.clamp_(0.0, 1.0)
+                delta.data += sign * cfg.step_size * delta.grad.sign()
+                delta.data.clamp_(-cfg.epsilon, cfg.epsilon)
 
             # Logging
             if step % cfg.log_every == 0 or step == cfg.num_steps - 1:
-                with torch.no_grad():
-                    R_eval, T_eval, bg_eval = sample_transforms(4, self.transform_cfg, self.device)
-                    imgs_eval, _ = renderer.render_with_background(R_eval, T_eval, bg_eval)
-                    preds = self.classifier(imgs_eval).argmax(dim=1).tolist()
+                rate, preds, prot_prob = self._eval_fool(
+                    min(8, max(4, cfg.eot_samples)), delta.detach())
+                history["step"].append(step)
+                history["loss"].append(loss.item())
+                history["fool_rate"].append(rate)
+                history["protected_prob"].append(prot_prob)
+                if cfg.target_class is not None:
+                    tag = "success"
+                elif prot is not None:
+                    tag = "de-turtled"
+                else:
+                    tag = "fooled"
+                extra = f"  turtle_p={prot_prob:.0%}" if prot_prob is not None else ""
+                print(f"  [EOT 3D mask] step {step:4d}/{cfg.num_steps}  "
+                      f"loss={loss.item():.4f}  {tag}={rate:.0%}{extra}  preds={preds}")
 
-                history["loss"].append(step_loss)
-                history["pred"].append(preds)
-                print(f"  [EOT 3D] step {step:4d}/{cfg.num_steps}  "
-                      f"loss={step_loss:.4f}  preds={preds}")
+        return delta.detach(), history
 
-        return renderer.texture_map.detach().clone(), history
+
+# Backwards-compatible alias (the attack is now mask-based, not texture-based).
+EOTAttack3D = EOTMaskAttack3D

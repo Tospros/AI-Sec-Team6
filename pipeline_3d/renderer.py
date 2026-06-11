@@ -184,6 +184,62 @@ def _load_obj_simple(obj_path: str):
     return verts_np, faces_v_np, uvs_np, faces_uv_np
 
 
+def _load_diffuse_texture(obj_path: str, texture_size: int) -> Optional[torch.Tensor]:
+    """
+    Resolve the diffuse texture (map_Kd) referenced by the .obj's mtllib and load it.
+
+    Filenames may contain spaces (e.g. "... v1 Textured.mtl"), so the value is taken
+    as the full remainder of the line after the keyword rather than a single token.
+
+    Returns (1, texture_size, texture_size, 3) float tensor in [0, 1], or None if no
+    usable texture is found.
+    """
+    import os
+    from PIL import Image
+
+    obj_dir = os.path.dirname(os.path.abspath(obj_path))
+
+    def _value_after(line: str, keyword: str) -> Optional[str]:
+        stripped = line.strip()
+        if stripped.lower().startswith(keyword.lower()):
+            return stripped[len(keyword):].strip()
+        return None
+
+    # Collect mtllib references from the .obj
+    mtl_files = []
+    with open(obj_path) as f:
+        for line in f:
+            v = _value_after(line, "mtllib")
+            if v:
+                mtl_files.append(v)
+
+    # Find the first map_Kd across the referenced .mtl files
+    tex_name = None
+    for mtl in mtl_files:
+        mtl_path = os.path.join(obj_dir, mtl)
+        if not os.path.exists(mtl_path):
+            continue
+        with open(mtl_path) as f:
+            for line in f:
+                v = _value_after(line, "map_Kd")
+                if v:
+                    tex_name = v
+                    break
+        if tex_name:
+            break
+
+    if not tex_name:
+        return None
+
+    tex_path = os.path.join(obj_dir, tex_name)
+    if not os.path.exists(tex_path):
+        return None
+
+    img = Image.open(tex_path).convert("RGB").resize((texture_size, texture_size))
+    arr = np.asarray(img, dtype=np.float32) / 255.0   # (H, W, 3)
+    return torch.from_numpy(arr).unsqueeze(0)          # (1, H, W, 3)
+
+
 def _rasterize(verts_2d: np.ndarray, depths: np.ndarray,
                faces_v: np.ndarray, faces_uv: np.ndarray,
                verts_uvs: np.ndarray, H: int, W: int):
@@ -285,6 +341,7 @@ class SoftwareTexturedMeshRenderer(nn.Module):
         image_size: int = 224,
         device: Optional[torch.device] = None,
         init_texture: Optional[torch.Tensor] = None,
+        normalize_mesh: bool = True,
     ):
         super().__init__()
         self.device = device or torch.device("cpu")
@@ -292,6 +349,16 @@ class SoftwareTexturedMeshRenderer(nn.Module):
         self.texture_size = texture_size
 
         verts_np, faces_v_np, uvs_np, faces_uv_np = _load_obj_simple(obj_path)
+
+        # Center at origin and scale to unit bounding-sphere radius so the object
+        # is consistently framed regardless of the .obj's modelling units/offset.
+        if normalize_mesh and len(verts_np):
+            mn, mx = verts_np.min(0), verts_np.max(0)
+            center = (mn + mx) / 2.0
+            radius = float(np.linalg.norm((mx - mn) / 2.0))
+            if radius > 0:
+                verts_np = ((verts_np - center) / radius).astype(np.float32)
+
         self.verts_np = verts_np
         self.faces_v_np = faces_v_np
         self.uvs_np = uvs_np
@@ -302,7 +369,9 @@ class SoftwareTexturedMeshRenderer(nn.Module):
             if tex.dim() == 3:
                 tex = tex.unsqueeze(0)
         else:
-            tex = torch.ones(1, texture_size, texture_size, 3) * 0.5
+            tex = _load_diffuse_texture(obj_path, texture_size)
+            if tex is None:
+                tex = torch.ones(1, texture_size, texture_size, 3) * 0.5
 
         self.texture_map = nn.Parameter(tex.to(self.device))
 

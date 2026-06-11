@@ -23,7 +23,7 @@ from pathlib import Path
 
 from pipeline_3d.renderer import TexturedMeshRenderer, SoftwareTexturedMeshRenderer
 from pipeline_3d.transforms import TransformConfig, sample_transforms
-from pipeline_3d.attack import EOTAttack3D, Attack3DConfig
+from pipeline_3d.attack import EOTMaskAttack3D, Attack3DConfig
 from models.classifier import InceptionV3Classifier, IMAGENET_CLASSES
 
 
@@ -95,6 +95,11 @@ def render_views(renderer, transform_cfg, n, device):
     return images  # (n, H, W, 3)
 
 
+def apply_mask(images, delta):
+    """Overlay the screen-space mask on rendered projections: 'look through the mask'."""
+    return (images + delta.to(images.device)).clamp(0.0, 1.0)
+
+
 def show_views(images, classifier, title, save_path=None):
     n = images.shape[0]
     with torch.no_grad():
@@ -135,9 +140,9 @@ def main():
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--eot", type=int, default=10,
                         help="EOT samples per step (more = slower but better gradients)")
-    parser.add_argument("--step_size", type=float, default=0.01)
-    parser.add_argument("--epsilon", type=float, default=None,
-                        help="L-inf constraint on texture change (None = unconstrained)")
+    parser.add_argument("--step_size", type=float, default=0.005)
+    parser.add_argument("--epsilon", type=float, default=0.05,
+                        help="L-inf bound on the screen-space mask")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--texture_size", type=int, default=128)
     parser.add_argument("--n_views", type=int, default=6)
@@ -193,37 +198,50 @@ def main():
     mode = f"targeted -> class {args.target}" if args.target is not None else "untargeted"
     print(f"\n--- Attack: {mode} | steps={args.steps} eot={args.eot} ---")
 
-    attack = EOTAttack3D(
+    attack = EOTMaskAttack3D(
         classifier=classifier,
         renderer=renderer,
         transform_cfg=transform_cfg,
         attack_cfg=attack_cfg,
         device=device,
     )
-    best_texture, history = attack.attack()
+    delta, history = attack.attack()
 
-    # ── After attack ──────────────────────────────────────────────────────────
+    # ── After attack: render clean projections, then look through the mask ──────
     print(f"\n--- After attack ---")
-    images_after = render_views(renderer, transform_cfg, args.n_views, device)
+    images_clean = render_views(renderer, transform_cfg, args.n_views, device)
+    images_after = apply_mask(images_clean, delta)
     show_views(images_after, classifier, f"After attack ({mode})",
                save_path=str(save_dir / "after.png"))
 
-    # ── Save adversarial texture ──────────────────────────────────────────────
-    tex_img = best_texture.squeeze(0).cpu().numpy().clip(0, 1)
-    plt.imsave(str(save_dir / "adv_texture.png"), tex_img)
-    print(f"Adversarial texture saved: {save_dir}/adv_texture.png")
+    # Final fooling rate on a fresh batch of viewpoints
+    fool_rate, _, _ = attack._eval_fool(max(args.n_views, 8), delta)
+    metric = "target success" if args.target is not None else "fool rate"
+    print(f"Final {metric}: {fool_rate:.0%}")
 
-    # ── Loss curve ────────────────────────────────────────────────────────────
+    # ── Save the optimized mask ────────────────────────────────────────────────
+    # Mask values live in [-eps, eps]; rescale to [0, 1] for display.
+    eps = max(args.epsilon, 1e-8)
+    mask_vis = ((delta.squeeze(0).cpu().numpy() / (2 * eps)) + 0.5).clip(0, 1)
+    plt.imsave(str(save_dir / "adv_mask.png"), mask_vis)
+    print(f"Adversarial mask saved: {save_dir}/adv_mask.png")
+
+    # ── Loss / fooling curves ──────────────────────────────────────────────────
     if len(history["loss"]) > 1:
-        plt.figure(figsize=(6, 3))
-        plt.plot(history["loss"])
-        plt.xlabel("Log step")
-        plt.ylabel("Loss")
-        plt.title("EOT 3D attack loss")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3))
+        ax1.plot(history["loss"])
+        ax1.set_xlabel("Log step")
+        ax1.set_ylabel("Loss")
+        ax1.set_title("EOT 3D mask loss")
+        ax2.plot(history["fool_rate"], color="tab:red")
+        ax2.set_xlabel("Log step")
+        ax2.set_ylabel("Rate")
+        ax2.set_ylim(0, 1)
+        ax2.set_title("Target success" if args.target is not None else "Fool rate")
         plt.tight_layout()
         plt.savefig(str(save_dir / "loss_curve.png"), dpi=120)
         plt.close()
-        print(f"Loss curve saved: {save_dir}/loss_curve.png")
+        print(f"Curves saved: {save_dir}/loss_curve.png")
 
     print("\nDone.")
 
