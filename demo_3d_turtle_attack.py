@@ -35,12 +35,17 @@ TURTLE_CLASSES = [33, 34, 35, 36, 37]
 
 
 def turtle_view_config() -> TransformConfig:
-    """Viewpoint distribution under which the clean turtle reads as a turtle."""
+    """Viewpoint distribution under which the clean turtle reads as a turtle.
+
+    Paired with a telephoto FOV (see --fov), this frames the turtle large in
+    the image (~20% pixel fill) so a screen-space mask must actually overpower a
+    prominent, confidently-classified turtle rather than a tiny one.
+    """
     return TransformConfig(
         rotation_mode="yaw_pitch",
         yaw_min_deg=170.0, yaw_max_deg=220.0,
         pitch_min_deg=55.0, pitch_max_deg=90.0,
-        dist_min=2.5, dist_max=3.0,
+        dist_min=2.6, dist_max=3.0,
         bg_color_min=0.5, bg_color_max=0.9,
     )
 
@@ -91,6 +96,8 @@ def main():
     parser.add_argument("--n_views", type=int, default=5)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--texture_size", type=int, default=256)
+    parser.add_argument("--fov", type=float, default=30.0,
+                        help="Camera field of view (deg). Lower = telephoto = larger turtle.")
     parser.add_argument("--save_dir", type=str, default="turtle_attack_output")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
@@ -100,7 +107,7 @@ def main():
 
     renderer = TexturedMeshRenderer(
         obj_path=args.obj, texture_size=args.texture_size,
-        image_size=args.image_size, device=device,
+        image_size=args.image_size, device=device, fov_deg=args.fov,
     )
     classifier = InceptionV3Classifier(device=device)
     names = models.Inception_V3_Weights.IMAGENET1K_V1.meta["categories"]

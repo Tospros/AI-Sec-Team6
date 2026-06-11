@@ -73,13 +73,26 @@ class _Pytorch3DTexturedMeshRenderer(nn.Module):
         image_size: int = 224,
         device: Optional[torch.device] = None,
         init_texture: Optional[torch.Tensor] = None,
+        normalize_mesh: bool = True,
+        fov_deg: float = 60.0,
     ):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.image_size = image_size
         self.texture_size = texture_size
+        self.fov_deg = fov_deg
 
         verts, faces, aux = load_obj(obj_path, load_textures=True, device=self.device)
+
+        # Center at origin and scale to unit bounding-sphere radius (matches the
+        # software backend so both render the object at the same framing).
+        if normalize_mesh and verts.numel():
+            mn, mx = verts.min(0).values, verts.max(0).values
+            center = (mn + mx) / 2.0
+            radius = torch.linalg.norm((mx - mn) / 2.0)
+            if radius > 0:
+                verts = (verts - center) / radius
+
         self.register_buffer("verts", verts)
         self.register_buffer("faces_idx", faces.verts_idx)
         self.register_buffer("faces_tex_idx", faces.textures_idx)
@@ -127,7 +140,7 @@ class _Pytorch3DTexturedMeshRenderer(nn.Module):
 
     def forward(self, R, T, lights=None):
         B = R.shape[0]
-        cameras = FoVPerspectiveCameras(R=R, T=T, device=self.device)
+        cameras = FoVPerspectiveCameras(R=R, T=T, fov=self.fov_deg, device=self.device)
         if lights is None:
             lights = AmbientLights(device=self.device)
         meshes = self._build_mesh(B)
@@ -139,7 +152,7 @@ class _Pytorch3DTexturedMeshRenderer(nn.Module):
 
     def render_with_background(self, R, T, bg, lights=None):
         B = R.shape[0]
-        cameras = FoVPerspectiveCameras(R=R, T=T, device=self.device)
+        cameras = FoVPerspectiveCameras(R=R, T=T, fov=self.fov_deg, device=self.device)
         if lights is None:
             lights = AmbientLights(device=self.device)
         meshes = self._build_mesh(B)
@@ -342,11 +355,13 @@ class SoftwareTexturedMeshRenderer(nn.Module):
         device: Optional[torch.device] = None,
         init_texture: Optional[torch.Tensor] = None,
         normalize_mesh: bool = True,
+        fov_deg: float = 60.0,
     ):
         super().__init__()
         self.device = device or torch.device("cpu")
         self.image_size = image_size
         self.texture_size = texture_size
+        self.fov_deg = fov_deg
 
         verts_np, faces_v_np, uvs_np, faces_uv_np = _load_obj_simple(obj_path)
 
@@ -377,7 +392,7 @@ class SoftwareTexturedMeshRenderer(nn.Module):
 
     def _render_single(self, R: torch.Tensor, T: torch.Tensor, bg: torch.Tensor) -> torch.Tensor:
         H = W = self.image_size
-        verts_2d, depths = _project_verts(self.verts_np, R, T, H, W)
+        verts_2d, depths = _project_verts(self.verts_np, R, T, H, W, fov_deg=self.fov_deg)
         uv_map, mask = _rasterize(
             verts_2d, depths,
             self.faces_v_np, self.faces_uv_np,
@@ -422,11 +437,17 @@ def TexturedMeshRenderer(
     image_size: int = 224,
     device: Optional[torch.device] = None,
     init_texture: Optional[torch.Tensor] = None,
+    normalize_mesh: bool = True,
+    fov_deg: float = 60.0,
 ) -> nn.Module:
     """
     Returns a PyTorch3D renderer when available, otherwise the software fallback.
     Both implement the same interface: forward(R, T) and render_with_background(R, T, bg).
+
+    fov_deg: camera field of view. Lower = telephoto (object appears larger with
+             flatter perspective) — useful to make a small object fill the frame.
     """
     cls = _Pytorch3DTexturedMeshRenderer if HAS_PYTORCH3D else SoftwareTexturedMeshRenderer
     return cls(obj_path, texture_size=texture_size, image_size=image_size,
-               device=device, init_texture=init_texture)
+               device=device, init_texture=init_texture,
+               normalize_mesh=normalize_mesh, fov_deg=fov_deg)
