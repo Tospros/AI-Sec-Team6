@@ -1,0 +1,41 @@
+services:
+  attack-3d:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTORCH3D: "1"          # kompiluje PyTorch3D ze źródeł (~15 min przy pierwszym buildzie)
+    image: ai-sec-3d:latest
+
+    volumes:
+      - ./turtle:/app/turtle:ro      # input: mesh żółwia (read-only)
+      - ./attack_output:/app/output  # output: before/after/tekstura/loss_curve
+
+    # Domyślne uruchomienie: atak na mesh żółwia, cel = rifle (764)
+    # Zmień argumenty według potrzeb:
+    #   --obj          ścieżka do pliku .obj
+    #   --target       indeks klasy ImageNet (rifle=764, baseball=429, turtle=35)
+    #   --steps        liczba kroków PGD (więcej = silniejszy atak, wolniej)
+    #   --eot          próbki EOT na krok (więcej = lepsza robustność, wolniej)
+    #   --step_size    długość kroku PGD
+    #   --epsilon      L-inf ball wokół oryginalnej tekstury (None = bez ograniczenia)
+    #   --texture_size rozdzielczość mapy tekstury
+    command: >
+      python demo_3d_attack.py
+        --obj          "turtle/20446_Sea_Turtle_v1 Textured.obj"
+        --target       764
+        --steps        500
+        --eot          40
+        --step_size    0.01
+        --texture_size 256
+        --save_dir     output
+
+    # GPU wymagane dla rozsądnego czasu (73k trójkątów × 40 EOT × 500 kroków)
+    # Bez GPU: działa na CPU ale bardzo wolno
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

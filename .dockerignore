@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+attack_output/
+output/
+renders.png
+*.egg-info/
+.pytest_cache/

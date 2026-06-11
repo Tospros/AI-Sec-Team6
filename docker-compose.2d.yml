@@ -1,0 +1,37 @@
+services:
+  attack-2d:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTORCH3D: "0"          # 2D attack nie potrzebuje PyTorch3D
+    image: ai-sec-2d:latest
+
+    volumes:
+      - ./turtle:/app/turtle:ro  # input: mesh i tekstury żółwia (read-only)
+      - ./output:/app/output     # output: wyniki ataku
+
+    # Domyślne uruchomienie: atak na zdjęcie żółwia, cel = rifle (764)
+    # Zmień argumenty według potrzeb:
+    #   --image     ścieżka do obrazu wejściowego (PNG/JPG)
+    #   --target    indeks klasy ImageNet
+    #   --steps     liczba kroków PGD
+    #   --epsilon   budżet perturbacji L-inf
+    #   --eot_samples liczba próbek EOT na krok
+    command: >
+      python demo_2d_attack.py
+        --image  "turtle/20446_Sea_Turtle_diff.jpg"
+        --target 764
+        --steps  200
+        --epsilon 0.05
+        --eot_samples 20
+        --save   output/result_2d.png
+
+    # GPU opcjonalne — bez niego używa CPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
