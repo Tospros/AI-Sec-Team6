@@ -107,12 +107,12 @@ class EOTAttack2D:
                 if self.cfg.target_class is not None:
                     target = torch.tensor([self.cfg.target_class], device=self.device)
                     loss = F.cross_entropy(logits, target)
-                    total_loss = total_loss - loss  # minimize CE ↔ maximize target
+                    total_loss = total_loss + loss  # minimize CE → maximize P(target)
                 else:
                     pred = logits.argmax(dim=1)
-                    target = pred  # maximize CE on current prediction
+                    target = pred  # push away from current prediction
                     loss = F.cross_entropy(logits, target)
-                    total_loss = total_loss + loss
+                    total_loss = total_loss - loss  # maximize CE
 
             total_loss = total_loss / self.cfg.eot_samples
             total_loss.backward()

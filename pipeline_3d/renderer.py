@@ -131,10 +131,8 @@ class _Pytorch3DTexturedMeshRenderer(nn.Module):
         if lights is None:
             lights = AmbientLights(device=self.device)
         meshes = self._build_mesh(B)
-        images = self.shader(
-            self.rasterizer(meshes, cameras=cameras),
-            cameras=cameras, lights=lights,
-        )
+        fragments = self.rasterizer(meshes, cameras=cameras)
+        images = self.shader(fragments, meshes, cameras=cameras, lights=lights)
         return images[..., :3], _build_transform_matrix(R, T)
 
     def render_with_background(self, R, T, bg, lights=None):
@@ -144,7 +142,7 @@ class _Pytorch3DTexturedMeshRenderer(nn.Module):
             lights = AmbientLights(device=self.device)
         meshes = self._build_mesh(B)
         fragments = self.rasterizer(meshes, cameras=cameras)
-        raw = self.shader(fragments, cameras=cameras, lights=lights)
+        raw = self.shader(fragments, meshes, cameras=cameras, lights=lights)
         rgb, alpha = raw[..., :3], raw[..., 3:4]
         composited = rgb * alpha + bg[:, None, None, :] * (1.0 - alpha)
         return composited, _build_transform_matrix(R, T)

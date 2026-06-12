@@ -101,10 +101,10 @@ class EOTAttack3D:
 
                 if cfg.target_class is not None:
                     target = torch.tensor([cfg.target_class], device=self.device)
-                    loss = -F.cross_entropy(logits, target)   # maximize target class prob
+                    loss = F.cross_entropy(logits, target)    # minimize CE → maximize P(target)
                 else:
                     pred = logits.argmax(dim=1).detach()
-                    loss = F.cross_entropy(logits, pred)       # maximize CE on current pred
+                    loss = -F.cross_entropy(logits, pred)     # maximize CE → push away from current pred
 
                 (loss / cfg.eot_samples).backward()
                 step_loss_accum += loss.item()
